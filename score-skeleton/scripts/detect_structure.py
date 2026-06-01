@@ -19,10 +19,13 @@ import cv2, numpy as np, os, json, sys
 
 MERGE_THRESHOLD = 20  # px: compound barline grouping (inc. repeat signs)
 DOT_DISTANCE = 35    # px: max distance from compound center to look for dots
-DOT_MIN_AREA = 20
+MERGE_THRESHOLD = 20
+DOT_DISTANCE = 35
+DOT_MIN_AREA = 20   # 아래: noise speck, 위: staff junction/lyric dot
 DOT_MAX_AREA = 120
 
 def detect_dots(gray_segment, x_center, staff_ys):
+    """Detect repeat dots near barline compound."""
     """Detect small round blobs near x_center within staff y-ranges."""
     h = gray_segment.shape[0]
     # Search strip: ±DOT_DISTANCE around x_center, full height
@@ -41,7 +44,7 @@ def detect_dots(gray_segment, x_center, staff_ys):
         a = stats[i, cv2.CC_STAT_AREA]
         cx, cy = centroids[i]
 
-        # Size filter: small but not tiny
+        # Area+size filter: exclude noise (<20px²), staff junctions (>120px²)
         if not (DOT_MIN_AREA < a < DOT_MAX_AREA and 4 < cw < 20 and 4 < ch < 20):
             continue
 
@@ -132,21 +135,29 @@ def detect_page(page_num, img_dir='_scratch', out_dir=None):
 
     used = set()
     staves = []
-    for i in range(len(peaks)-4):
-        if i in used: continue
+    i = 0
+    while i < len(peaks) - 4:
+        if i in used: i += 1; continue
         t = peaks[i]
-        expected = [(t + 19 * (j+1), 3) for j in range(4)]
-        found = [t]; pos = i + 1; ok = True
-        for exp, tol in expected:
-            while pos < len(peaks) and peaks[pos] < exp - tol: pos += 1
-            if pos < len(peaks) and abs(peaks[pos] - exp) <= tol:
-                found.append(peaks[pos]); used.add(pos); pos += 1
-            else: ok = False; break
-        if ok:
-            staves.append({'top': found[0], 'bot': found[-1]})
+        # Try multiple inter-line spacings (13-21px) for varied DPI/layouts
+        best_found = None
+        for spacing in range(13, 22):
+            expected = [t + spacing * (j+1) for j in range(4)]
+            f = [t]; pos = i + 1; ok = True; tol = 4
+            for exp in expected:
+                while pos < len(peaks) and peaks[pos] < exp - tol: pos += 1
+                if pos < len(peaks) and abs(peaks[pos] - exp) <= tol:
+                    f.append(peaks[pos]); used.add(pos); pos += 1
+                else: ok = False; break
+            if ok:
+                best_found = f
+                break
+        if best_found:
+            staves.append({'top': best_found[0], 'bot': best_found[-1]})
             used.add(i)
+        i += 1
 
-    # 3-stave systems
+    # Group staves into systems (3 per system for vocal+guitar+TAB)
     raw_systems = [staves[i:i+3] for i in range(0, len(staves)-2, 3)]
     raw_systems = [s for s in raw_systems if len(s) >= 2]
 
