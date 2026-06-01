@@ -33,7 +33,7 @@ Sources: Wikipedia "Repeat sign", Wikipedia "Bar (music)", MuseScore Handbook
   - Width 4-20px, height 4-20px
   - Circularity ≥ 0.5
   - Within staff y-range (between staff top and bottom)
-- Piano 3-stave scores: expect 6 dots (2 per staff), but ≥2 on a side suffices for classification
+- Multi-stave systems: expect 2 repeat dots per staff, but ≥2 dots on a side suffices for classification
 - After merge + dot detection, classify:
   - `start_repeat` = compound + right-side dots
   - `end_repeat` = compound + left-side dots
@@ -41,15 +41,22 @@ Sources: Wikipedia "Repeat sign", Wikipedia "Bar (music)", MuseScore Handbook
   - `double` = compound + no dots
   - `final` = compound + last line thick (>6px) + no dots
 
-## Post-Processing (Step 3B)
+## Post-Processing
 
-When the first barline in a system is `start_repeat` AND the measure before it
-(the clef/key setup area) was read by LLM as "empty" (no chord symbol),
-that measure is NOT a real measure — discard it from the sequence and shift
-all subsequent numbers by -1.
+A `system_start → start_repeat` first gap can be a non-measure setup area:
 
-**Width heuristic is not needed and not safe** — clef key sharps/brackets
-create false-positive dark pixels in the chord zone. Use LLM confirmation only.
+`system_start | clef/key/time setup pseudo-gap | start_repeat | first real measure ...`
+
+Do **not** discard it merely because no chord symbols are present. Chordless real measures exist.
+
+Safe handling:
+
+- Treat only the first gap as a candidate: `gap_idx == 0`, `left_type == system_start`, `right_type == start_repeat`.
+- Verify visually/geometrically that the gap is the narrow setup area before the repeat sign.
+- If it is a full-width musical measure, preserve it even when chordless.
+- If verified as setup-only, mark that gap `skip=True` before global measure numbers are assigned.
+
+Width-only heuristics are not fully safe; clef/key sharps/brackets and engraving differences can mislead. Use structure + visual confirmation, never chord emptiness alone.
 
 ## Exception
 

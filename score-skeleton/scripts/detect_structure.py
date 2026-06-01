@@ -18,15 +18,12 @@ Usage: python3 scripts/detect_structure.py <page_n>
 import cv2, numpy as np, os, json, sys
 
 MERGE_THRESHOLD = 20  # px: compound barline grouping (inc. repeat signs)
-DOT_DISTANCE = 35    # px: max distance from compound center to look for dots
-MERGE_THRESHOLD = 20
-DOT_DISTANCE = 35
-DOT_MIN_AREA = 20   # 아래: noise speck, 위: staff junction/lyric dot
+DOT_DISTANCE = 35     # px: max distance from compound center to look for dots
+DOT_MIN_AREA = 20     # below: noise speck; above: staff junction/lyric dot
 DOT_MAX_AREA = 120
 
 def detect_dots(gray_segment, x_center, staff_ys):
-    """Detect repeat dots near barline compound."""
-    """Detect small round blobs near x_center within staff y-ranges."""
+    """Detect small round repeat-dot blobs near x_center within staff y-ranges."""
     h = gray_segment.shape[0]
     # Search strip: ±DOT_DISTANCE around x_center, full height
     x1 = max(0, x_center - DOT_DISTANCE)
@@ -75,38 +72,78 @@ def classify_barline_group(lines, dots_rel, staff_ys, page_w, is_first_group, is
     n = len(lines)
     if is_first_group:
         return 'system_start'
-    if is_last_group:
-        return 'system_end'
 
-    # Single line
-    if n == 1:
-        return 'thin'
-
-    # Multi-line: check for repeat dots FIRST
     gx = (lines[0]['x'] + lines[-1]['x']) // 2
     left_dots = [d for d in dots_rel if d['x'] < gx]
     right_dots = [d for d in dots_rel if d['x'] >= gx]
     has_left = len(left_dots) >= 2
     has_right = len(right_dots) >= 2
 
-    if has_left and has_right:
-        return 'end_start_repeat'
-    elif has_right:
-        return 'start_repeat'
-    elif has_left:
-        return 'end_repeat'
+    # Repeat signs may appear at a system end; classify dots before falling back
+    # to generic system_end.
+    if n > 1:
+        if has_left and has_right:
+            return 'end_start_repeat'
+        elif has_right:
+            return 'start_repeat'
+        elif has_left:
+            return 'end_repeat'
 
-    # Check for thick line (final barline = thin+thick)
-    # In standard notation, final barline has thin on left, thick on right
-    last_thick = lines[-1].get('thickness', 1) > 6
-    if last_thick:
-        return 'final'
+        # Standard final barline = thin + thick, usually at final system end.
+        last_thick = lines[-1].get('thickness', 1) > 6
+        if is_last_group and last_thick:
+            return 'final'
+        if not is_last_group:
+            return 'double'
 
-    # No dots, no thick → double barline (section boundary)
-    if n >= 2:
-        return 'double'
+    if is_last_group:
+        return 'system_end'
+    if n == 1:
+        return 'thin'
+    return 'double'
 
-    return 'unknown'
+def group_staves_by_vertical_gaps(staves):
+    """Group detected staves into systems without assuming a fixed stave count.
+
+    The split threshold is learned from adjacent staff gaps. Within-system gaps
+    are usually smaller than between-system gaps; if no clear two-cluster split
+    exists, fall back to a staff-height-scaled threshold so 1-stave lead sheets
+    still split between systems.
+    """
+    if not staves:
+        return []
+    staves = sorted(staves, key=lambda s: s['top'])
+    if len(staves) == 1:
+        return [staves]
+
+    gaps = [staves[i + 1]['top'] - staves[i]['bot'] for i in range(len(staves) - 1)]
+    heights = [s['bot'] - s['top'] for s in staves]
+    med_height = float(np.median(heights)) if heights else 70.0
+    base_threshold = max(90.0, med_height * 1.6)
+
+    pos_gaps = sorted(g for g in gaps if g > 0)
+    threshold = base_threshold
+    if len(pos_gaps) >= 2:
+        best_ratio = 0.0
+        best_mid = None
+        for a, b in zip(pos_gaps, pos_gaps[1:]):
+            ratio = b / max(a, 1)
+            if ratio > best_ratio:
+                best_ratio = ratio
+                best_mid = (a + b) / 2.0
+        if best_mid is not None and best_ratio >= 1.45:
+            threshold = best_mid
+
+    systems = []
+    current = [staves[0]]
+    for gap, staff in zip(gaps, staves[1:]):
+        if gap > threshold:
+            systems.append(current)
+            current = [staff]
+        else:
+            current.append(staff)
+    systems.append(current)
+    return systems
 
 def detect_page(page_num, img_dir='_scratch', out_dir=None):
     path = f'{img_dir}/page-{page_num}.png'
@@ -153,22 +190,23 @@ def detect_page(page_num, img_dir='_scratch', out_dir=None):
                 best_found = f
                 break
         if best_found:
-            staves.append({'top': best_found[0], 'bot': best_found[-1]})
+            staves.append({'top': best_found[0], 'bot': best_found[-1], 'line_count': len(best_found)})
             used.add(i)
         i += 1
 
-    # Group staves into systems (3 per system for vocal+guitar+TAB)
-    raw_systems = [staves[i:i+3] for i in range(0, len(staves)-2, 3)]
-    raw_systems = [s for s in raw_systems if len(s) >= 2]
+    # Group staves into systems by vertical gaps; do not assume fixed stave count.
+    raw_systems = [s for s in group_staves_by_vertical_gaps(staves) if len(s) >= 1]
 
-    print(f"Page {page_num}: {len(raw_systems)} systems, {len(staves)} staves")
+    stave_counts = [len(s) for s in raw_systems]
+    print(f"Page {page_num}: {len(raw_systems)} systems, {len(staves)} staves | stave_counts={stave_counts}")
 
     result = {'page': page_num, 'systems': []}
 
     for si, sys_staves in enumerate(raw_systems):
-        vocal = sys_staves[0]
-        s_top = max(0, vocal['top'] - 90)
-        s_bot = min(h, sys_staves[-1]['bot'] + 30)
+        first_staff = sys_staves[0]
+        last_staff = sys_staves[-1]
+        s_top = max(0, first_staff['top'] - 90)
+        s_bot = min(h, last_staff['bot'] + 30)
         sys_gray = gray[s_top:s_bot, :]
         _, sys_bin = cv2.threshold(sys_gray, 0, 255, cv2.THRESH_OTSU | cv2.THRESH_BINARY_INV)
         sys_h = s_bot - s_top
@@ -249,15 +287,26 @@ def detect_page(page_num, img_dir='_scratch', out_dir=None):
             })
 
         # --- Derive measure boundaries ---
-        # Number of measures = number of gaps between consecutive classified barlines
-        # With N classified barlines, there are N-1 gaps (= measures)
-        # crop_measures.py handles clef area removal separately
+        # A measure gap is the horizontal span between consecutive classified
+        # barline groups. Downstream code may mark the first system_start →
+        # start_repeat gap as a setup pseudo-gap, but the detector keeps all
+        # gaps raw so chordless real measures are not discarded here.
         n_meas = len(classified) - 1
 
-        # The first real barline = end of measure 1
-        # For proper crop: measures span from prev_barline.x to current_barline.x
+        measure_gaps = []
+        for gi in range(len(classified) - 1):
+            left = classified[gi]
+            right = classified[gi + 1]
+            measure_gaps.append({
+                'gap_idx': gi,
+                'x0': left['x'],
+                'x1': right['x'],
+                'left_type': left['type'],
+                'right_type': right['type'],
+                'width': right['x'] - left['x']
+            })
 
-        # Build measure boundaries array
+        # Build compact boundary array for debugging/inspection.
         meas_boundaries = []
         for b in classified:
             if b['type'] == 'system_start':
@@ -300,7 +349,12 @@ def detect_page(page_num, img_dir='_scratch', out_dir=None):
             'crop_path': os.path.abspath(crop_path),
             'y0_page': s_top,
             'y1_page': s_bot,
-            'vocal_staff_top': vocal['top'],
+            'first_staff_top': first_staff['top'],
+            'stave_count': len(sys_staves),
+            'staves': [
+                {'top': s['top'], 'bot': s['bot'], 'line_count': s.get('line_count', 5)}
+                for s in sys_staves
+            ],
             'num_measures': n_meas,
             'barlines': [
                 {
@@ -311,7 +365,8 @@ def detect_page(page_num, img_dir='_scratch', out_dir=None):
                     'dots_right': b['dots_right']
                 }
                 for b in classified
-            ]
+            ],
+            'measure_gaps': measure_gaps
         }
         result['systems'].append(sys_info)
 
