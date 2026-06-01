@@ -1,15 +1,2 @@
-# init
-*
-!.gitignore
-
 # skills
-!headless-cli-bridge/
-!headless-cli-bridge/**
-!score-skeleton-transcriber/
-!score-skeleton-transcriber/**
-!score-bass-tab-transcriber/
-!score-bass-tab-transcriber/**
-!amap-add-favorite/
-!amap-add-favorite/**
-!amap-update-memo/
-!amap-update-memo/**
+watchlist-md
