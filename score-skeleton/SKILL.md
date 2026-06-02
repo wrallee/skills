@@ -19,13 +19,6 @@ these values in the current session's thread. Re-asking for values the user
 just stated is a significant frustration signal — they will say "I already told you."
 Check first, ask only if session_search returns nothing relevant.
 
-**CRITICAL PITFALL — reference files are not a substitute for asking:**
-Even if a skill reference file (e.g. `references/to-find-you.md`) records the
-verified values from a prior session, do NOT skip the input gate and proceed
-without asking. The user may want to start completely fresh ("다 새로시작하려고한건데").
-Reference files document past work for future reference, NOT as pre-authorization
-to skip asking. The only valid bypass is when the user explicitly provides or
-confirms the values in the current session's conversation.
 ```
 
 Pipeline:
@@ -200,30 +193,20 @@ for e in measure_entries:
     e['crop_path'] = out
 ```
 
-**Annotated system crops (batch alternative for vision LLM):** crop each detected system, draw red barline markers, label measures in a top white strip. Useful when vision LLM is the primary reader (3-5 measures per crop, fewer API calls). Pitfall: system crops can misplace chord beat positions — prefer per-measure crops when accuracy matters.
+### 3D. Chord reading: PaddleOCR (default) → vision LLM (fallback)
 
-### 3D. LLM Vision prompt
+**Decision flow:**
 
-Process all systems in one phase. Prefer **parallel/bulk system-crop reading** over sequential per-measure requests: send multiple independent system crop vision calls in the same assistant turn when possible, or use the provider's batch/multi-image API when available. Each request should cover exactly one annotated system, not a full page.
+1. Generate **full-height per-measure crops** (section 3C)
+2. Run **PaddleOCR** on each crop. Parse `ocr.ocr(path, cls=False)`, collect text with conf ≥ 0.5.
+3. **Normalize** via `normalize_chord_text(cn)` — handles spaces (`D M7`→`DM7`), `E7sus4`→`Esus4addb7`, etc.
+4. **Filter non-chords**: keep only lines matching `^[A-G][#b]?` or `^/[A-G][#b]?$` (chord roots + standalone slashes)
+5. For any measure with **confidence < 0.5** or **unparseable output**, fall back to vision_analyze on the same full-height crop (see prompt below).
+6. Assign beat positions: if PaddleOCR gives chord texts but no beats, space chords evenly across the measure. Vision fallback gives explicit beats.
 
-For dense vocal+guitar+TAB scores, the system crop must include extra space above the top vocal staff, red measure-boundary lines, and measure labels in a top white strip so they do not cover chord symbols. Ask vision to read **only printed chord symbols above the top vocal staff** and ignore accompaniment/TAB/fret numbers. This avoids two recurring errors: mistaking accompaniment/TAB data for chords, and missing chord symbols that sit above the original system crop.
+**Vision fallback prompt:**
 
-Prompt template for annotated system crops:
-
-```text
-This image is one detected system from page {page}, system {system_idx}.
-Red vertical lines mark detector-owned measure boundaries. Measure labels M{first_measure}..M{last_measure} are shown in the top strip.
-Read only printed chord symbols above the top vocal staff. Ignore lyrics, notes, TAB, fret numbers, and accompaniment figures.
-Do not split, merge, add, or remove measures. Return exactly these measure keys, even if empty.
-Return JSON only:
-{
-  "M12": [{"chord": "A", "beat": 1.0}, {"chord": "C#m7", "beat": 3.0}],
-  "M13": []
-}
-If there are no chord symbols in a measure, use an empty list. Exact chord text.
-```
-
-Fallback prompt for a single measure crop:
+When PaddleOCR fails on a per-measure crop, use vision_analyze:
 
 ```text
 This image is one measure crop from page {page}, system {system_idx}, gap {gap_idx}.
@@ -234,7 +217,7 @@ Return JSON only: [{"chord": "A", "beat": 1.0}, {"chord": "C#m7", "beat": 3.0}]
 If there are no chord symbols in this measure, return []. Exact chord text.
 ```
 
-Collect results into:
+**Collect results from both OCR and fallback into:**
 
 ```python
 chord_map = {
@@ -242,17 +225,6 @@ chord_map = {
     2: [],
 }
 ```
-
-### 3E. Chord reading: PaddleOCR (default) → vision LLM (fallback)
-
-**Decision flow:**
-
-1. Generate **full-height per-measure crops** (section 3C)
-2. Run **PaddleOCR** on each crop. Parse `ocr.ocr(path, cls=False)`, collect text with conf ≥ 0.5.
-3. **Normalize** via `normalize_chord_text(cn)` — handles spaces (`D M7`→`DM7`), `E7sus4`→`Esus4addb7`, etc.
-4. **Filter non-chords**: keep only lines matching `^[A-G][#b]?` or `^/[A-G][#b]?$` (chord roots + standalone slashes)
-5. For any measure with **confidence < 0.5** or **unparseable output**, fall back to `vision_analyze` on the same full-height crop.
-6. Assign beat positions: if PaddleOCR gives chord texts but no beats, space chords evenly across the measure. Vision fallback gives explicit beats.
 
 **PaddleOCR** (v2.10.0 with paddlepaddle 2.6.2) reads chord symbols with high accuracy including sharp (#) and slash (/) glyphs. Speed: ~0.25-0.6s per image.
 
@@ -287,37 +259,7 @@ The standard `normalize_chord_text()` function already handles space removal via
 
 OCR engine comparison is in `references/paddleocr-setup.md`. In practice: always use PaddleOCR first via full-height per-measure crops. Fall back to vision_analyze only if PaddleOCR returns low confidence (<0.5) or unparseable text.
 
-### 3F. Speed optimization: subagent-based parallel per-measure reading
-
-When per-measure crop reading is needed (fallback from system crops or user requests better offset accuracy) and the user expresses concern about speed, use `delegate_task` to process measures in parallel batches via subagents with `toolsets=["vision"]`.
-
-Strategy:
-- Generate all per-measure crops first (section 3C)
-- Split into N batches (3 subagents × ~19 measures for a 57-measure score is a good default)
-- Each subagent independently reads its batch via vision_analyze and returns the chord_map chunk as JSON
-- Compile results from all subagent summaries
-
-```python
-# After per-measure crops are generated, batch them:
-import json
-entries = json.load(open('_scratch/measure_entries.json'))
-active = [e for e in entries if not e.get('skip')]
-active.sort(key=lambda e: (e['page'], e['system_idx'], e['gap_idx']))
-n = len(active)
-batch_size = (n + 2) // 3  # split into 3 batches
-batches = [active[i:i + batch_size] for i in range(0, n, batch_size)]
-
-# Build crop listing for each batch and delegate via delegate_task(tasks=...)
-# Each task gets toolsets=["vision"]. The subagent uses vision_analyze on each
-# crop file path, extracts chord text + beat, returns JSON.
-# The parent parses the returned JSON from each subagent's summary.
-```
-
-Pitfall: subagents cannot use `clarify`, `memory`, or `execute_code`. They produce text summaries, not file outputs — the parent must parse the returned JSON from the summary text. Do NOT write results to shared files from subagents; return them in the summary.
-
 ---
-
-
 
 ## 4. .mxl generation
 
@@ -516,17 +458,6 @@ print(f'{actual} chords in final.mxl')
 
 ## Notes
 
-- **Inputs first:** obtain user-provided `STAVES_PER_SYSTEM` and `EXPECTED_MEASURE_COUNT` before any tool work. Use session_search to check the current thread first; ask only if missing. Reference files from past sessions are NOT a substitute — the user may want a clean start.
-- **Phase order:** finish all pages in each phase before moving to the next phase.
 - **300dpi required** unless detector parameters are recalibrated.
-- **Chord reading priority:** PaddleOCR on full-height per-measure crops (section 3E) → vision_analyze as fallback. Annotated system crops (section 3C) are a batch option for vision-only but can misplace beat positions. See `references/paddleocr-setup.md` for comparison data.
-- **Chord injection:** after light normalization (spaces, unicode, parentheses), use `harmony.ChordSymbol(cn)`. Normalize `E7sus4` → `Esus4addb7` before parsing. Track `prev_full` (full chord text) for standalone slash-bass resolution. Do not use `chordKindStr` as a semantic fix. See section 4D for full rules.
-- **Chord display:** configure abbreviation preferences via `changeAbbreviationFor` / `CHORD_TYPES` reordering (M7, 7sus4, sus4, M9). Set `chordKindStr` from `getCurrentAbbreviationFor` only after successful semantic parse. See section 4D for the `apply_kind_display` helper.
-- **Barlines:** preserve `double`, `final`, `start_repeat`, and `end_repeat` from detected structure.
-- **System grouping:** use the user-provided stave count only. Do not infer it.
-- **Clean-slate reruns:** remove `_scratch/`, generated `.mxl`/`.musicxml`/`.zip`, `source.pdf`, and workdir-local scripts. Preserve original PDF and `.venv` (user preference).
-- **Subagent parallelism:** for per-measure vision fallback, delegate 3 batches with `toolsets=["vision"]` (section 3F).
-- **Generator script:** `gen_mxl.py` is a workdir-local temporary artifact.
-- **File delivery:** share workdir path or zip if Discord fails to attach `.mxl`.
 - **music21 offset behavior:** Negative `<offset sound="yes">` values in MusicXML (e.g., -20160 at beat 3) are correct — they are relative to the rest's END, not the measure start. Do not treat as a bug.
-- **References:** `references/paddleocr-setup.md` (OCR setup & comparison), `references/to-find-you.md` (known score facts), `references/music21-harmony-display.md` (display internals), `references/musicxml-7sus4.md` (7sus4 XML basis), `references/detection-params-300dpi.md` (detector params), `references/repeat-sign-notation.md` (repeat XML).
+- **References:** `references/paddleocr-setup.md` (OCR setup & comparison), `references/music21-harmony-display.md` (display internals), `references/musicxml-7sus4.md` (7sus4 XML basis), `references/detection-params-300dpi.md` (detector params), `references/repeat-sign-notation.md` (repeat XML).
