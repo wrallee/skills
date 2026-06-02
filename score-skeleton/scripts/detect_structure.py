@@ -13,8 +13,9 @@ Barline types:
   final         — thin+thick (end of piece)
   unknown       — detected but unclassified
 
-Usage: python3 scripts/detect_structure.py <page_n>
+Usage: python3 scripts/detect_structure.py <page_n> --staves-per-system <N>
 """
+import argparse
 import cv2, numpy as np, os, json, sys
 
 MERGE_THRESHOLD = 20  # px: compound barline grouping (inc. repeat signs)
@@ -102,6 +103,14 @@ def classify_barline_group(lines, dots_rel, staff_ys, page_w, is_first_group, is
         return 'thin'
     return 'double'
 
+def group_staves_fixed(staves, staves_per_system):
+    """Group staves by user-provided stave count per system."""
+    staves = sorted(staves, key=lambda s: s['top'])
+    if staves_per_system <= 0:
+        raise ValueError('staves_per_system must be positive')
+    systems = [staves[i:i + staves_per_system] for i in range(0, len(staves), staves_per_system)]
+    return [s for s in systems if len(s) == staves_per_system]
+
 def group_staves_by_vertical_gaps(staves):
     """Group detected staves into systems without assuming a fixed stave count.
 
@@ -145,7 +154,7 @@ def group_staves_by_vertical_gaps(staves):
     systems.append(current)
     return systems
 
-def detect_page(page_num, img_dir='_scratch', out_dir=None):
+def detect_page(page_num, img_dir='_scratch', out_dir=None, staves_per_system=None):
     path = f'{img_dir}/page-{page_num}.png'
     if not os.path.exists(path):
         print(f"ERROR: {path} not found"); return None
@@ -194,8 +203,15 @@ def detect_page(page_num, img_dir='_scratch', out_dir=None):
             used.add(i)
         i += 1
 
-    # Group staves into systems by vertical gaps; do not assume fixed stave count.
-    raw_systems = [s for s in group_staves_by_vertical_gaps(staves) if len(s) >= 1]
+    # Group staves into systems by user-provided stave count.
+    # Dynamic gap grouping is kept only as fallback when the count is not supplied.
+    if staves_per_system:
+        raw_systems = group_staves_fixed(staves, staves_per_system)
+        leftover = len(staves) - sum(len(s) for s in raw_systems)
+        if leftover:
+            print(f"WARNING: {leftover} leftover staff/staves after fixed grouping")
+    else:
+        raw_systems = [s for s in group_staves_by_vertical_gaps(staves) if len(s) >= 1]
 
     stave_counts = [len(s) for s in raw_systems]
     print(f"Page {page_num}: {len(raw_systems)} systems, {len(staves)} staves | stave_counts={stave_counts}")
@@ -378,5 +394,8 @@ def detect_page(page_num, img_dir='_scratch', out_dir=None):
     return result
 
 if __name__ == '__main__':
-    pn = int(sys.argv[1]) if len(sys.argv) > 1 else 1
-    detect_page(pn)
+    parser = argparse.ArgumentParser()
+    parser.add_argument('page_num', type=int, nargs='?', default=1)
+    parser.add_argument('--staves-per-system', type=int, required=False)
+    args = parser.parse_args()
+    detect_page(args.page_num, staves_per_system=args.staves_per_system)

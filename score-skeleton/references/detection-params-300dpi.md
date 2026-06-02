@@ -4,7 +4,7 @@
 - Size: ~2481×3509px (A4 at 300dpi)
 - Staff line spacing: 17-21px (5 lines per staff; varies by engraver/PDF generation)
 - Staff height: ~64-84px (top line to bottom line)
-- System height: varies by stave count and spacing; detect from grouped staves, do not assume 3 staves
+- System height varies by stave count and spacing; use the provided `STAVES_PER_SYSTEM` to group staves, then derive system height from each group
 - Chord area y-range: vocal staff top - 105px to vocal staff top + 5px (adjust if chords clipped)
 - Scores may have 1, 2, 3, or more staves per system; `stave_count` is detected per system
 
