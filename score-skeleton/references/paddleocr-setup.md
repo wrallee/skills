@@ -18,9 +18,9 @@ python3.11 -m venv /tmp/paddle_venv
 
 This downloads ~2GB of model files on first run. Models cached at `~/.paddleocr/whl/` and `~/.paddlex/official_models/`.
 
-## Tested Accuracy (full-height measure crops, PAD_X=16)
+## Observed behavior (first-staff tight crops, PAD_X=16)
 
-Per-measure, full system height. 57 measures across 3 scores.
+Per-measure crop from system start (`y0`) to first staff bottom (`staves[0].bot`), PAD_X=16. Current SKILL.md uses this crop shape because it keeps chord symbols + first staff while excluding lower staffs/lyrics noise.
 
 | Input | OCR Output | Confidence | Correct? |
 |-------|-----------|------------|----------|
@@ -56,16 +56,16 @@ def normalize_paddleocr(cn):
 ## Performance
 
 - Cold start (loading models): ~15s (download + init on first run)
-- Per image: ~0.25-0.6s (full-height measure crop, ~40-65KB)
+- Per image: ~0.25-0.6s (first-staff tight measure crop)
 - 57 measures total: ~5-12s (sequential)
 
 ## OCR Engine Comparison (measure crops, 3 scores × 5 measures = 15 test images)
 
-| Engine | # (sharp) | / (slash) | 7 (seven) | Speed/image | Noise |
-|--------|-----------|-----------|-----------|-------------|-------|
-| Tesseract 5 | ⚠️ ~50% (F#m/Fim) | ⚠️ /E 읽힘, /A 실패 | ⚠️ variable | ~0.3-0.9s | ❌ 매우 심함 |
-| EasyOCR | ❌ 0% (Fim/FHm) | ❌ I로 읽음 | ⚠️ Z for 7 | ~0.1-0.4s | ⚠️ lyrics 섞임 |
-| **PaddleOCR 2.10** | ✅ 100% (15/15) | ✅ 90% | ✅ 100% | **~0.25-0.6s** | ✅ conf 필터링 가능 |
-| vision LLM | ✅ | ✅ (full crop) | ✅ | ~8-12s | ✅ context 이해 |
+| Engine | Sharp/slash handling | Speed/image | Notes |
+|--------|----------------------|-------------|-------|
+| Tesseract 5 | unreliable on `#` and slash-bass samples | ~0.3-0.9s | noisy on measure crops |
+| EasyOCR | unreliable on `#`; often reads slash as `I` | ~0.1-0.4s | lyrics/noise mix in more often |
+| **PaddleOCR 2.10** | best empirical result on the sample set | ~0.25-0.6s | confidence values available for filtering |
+| vision LLM | useful fallback when OCR fails | ~8-12s | slower; use selectively |
 
-Tested on: Sing Street "To Find You", G-Dragon "Untitled 2014", 청하 "Roller Coaster". All tests used the same full-height measure crops, not chord-only crops (which would favor OCR engines further).
+Tested on: Sing Street "To Find You", G-Dragon "Untitled 2014", 청하 "Roller Coaster". Current production crop is first-staff tight (`y0` → `staves[0].bot`, PAD_X=16). If crop parameters change, rerun a representative sample before updating SKILL.md.

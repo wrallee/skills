@@ -7,31 +7,17 @@ description: >-
 
 # Score Skeleton Transcription
 
-```
-Required inputs before starting — HARD STOP if missing:
-  STAVES_PER_SYSTEM       # user-provided only; do not infer/guess from the page
-  EXPECTED_MEASURE_COUNT  # user-provided total real measures; do not count by eye
+**Input gate:** `STAVES_PER_SYSTEM` and `EXPECTED_MEASURE_COUNT` are required. Check `session_search` for the current thread first; if either value is missing, ask the user and stop. Do not infer stave count, count measures by eye, or start PDF conversion/detection/OCR/generation before both values are known.
 
-If either value is missing, ask the user for it and do no PDF conversion, detection, vision reading, or generation yet.
+**Pipeline:** PDF → PNG → OpenCV structure detection → PaddleOCR chord reading → vision fallback only when needed → `.mxl` generation → MusicXML post-process. Run each phase across all pages before moving to the next.
 
-Before asking, use session_search to check whether the user already provided
-these values in the current session's thread. Re-asking for values the user
-just stated is a significant frustration signal — they will say "I already told you."
-Check first, ask only if session_search returns nothing relevant.
+## Pitfalls
 
-```
-
-Pipeline:
-  1. PDF → PNG                    (pdftoppm -r 300, all pages first)
-  2. OpenCV structure detection    (given stave count → systems → barline x-boundaries)
-  3. Chord reading                 (PaddleOCR on per-measure crops → vision LLM fallback)
-  4. .mxl generation               (metadata + breaks + ChordSymbol)
-  5. MusicXML post-process          (exact chord display + barlines/repeats)
-```
-
-**Run by phase across all pages.**
-
-**Input gate:** `STAVES_PER_SYSTEM` and `EXPECTED_MEASURE_COUNT` are prerequisites. Do not infer stave count, do not count measures by eye, and do not skip asking based on reference files from past sessions. Use session_search to check the current thread first, then ask the user if missing.
+- **Don't over-verify with vision.** Use vision only for OCR failure, low-confidence output, or targeted sharp-key checks. Otherwise generate the `.mxl` and let the user review.
+- **OCR misses # on sharp keys.** PaddleOCR can miss the `#` glyph in 4+ sharp keys (E major, B major, etc.), reading `F` instead of `F#`, `C` instead of `C#`. After OCR, flag single-letter chords that are diatonic sharps in the key signature — verify with vision only for those, or note them for user review.
+- **`(add9)` parentheses.** music21 rejects `A(add9)` — strip parens to `Aadd9` before `ChordSymbol()`.
+- **Crop = first staff area only.** Crops run from system start (`y0`) to first staff bottom (`staves[0].bot`). This captures chord symbols above the staff while excluding lower staffs that add OCR noise. Use PAD_X=16 and do not add top/bottom margins by default. If you modify crop parameters, re-verify OCR output on a representative sample.
+- **PaddleOCR scope = chord symbols only.** PaddleOCR reads printed chord text (`DM7`, `G/B`, `F#m`), not notation symbols. Full notation needs OMR; do not expand this pipeline beyond chords.
 
 ---
 
@@ -133,6 +119,8 @@ for fpath in struct_files:
                 'gap_idx': gap['gap_idx'],
                 'y0': sys['y0_page'],
                 'y1': sys['y1_page'],
+                'first_staff_top': sys['first_staff_top'],
+                'first_staff_bot': sys['staves'][0]['bot'] if sys.get('staves') else sys['first_staff_top'] + 77,
                 'x0': gap['x0'],
                 'x1': gap['x1'],
                 'left_type': gap['left_type'],
@@ -174,7 +162,7 @@ assert MEASURE_COUNT == EXPECTED_MEASURE_COUNT, (MEASURE_COUNT, EXPECTED_MEASURE
 
 ### 3C. Crop generation
 
-**Full-height per-measure crops (primary):** crop each detected measure gap at full system height. All OCR comparison tests were done on these. PAD_X = 16. These give PaddleOCR the full chord area + staff context needed for beat positioning.
+**First-staff per-measure crops (primary):** crop each measure from system start (`y0`) to first staff bottom (`first_staff_bot`), with `PAD_X = 16` and no vertical margins. This captures chord text while excluding lower-staff/lyrics noise.
 
 ```python
 os.makedirs('_scratch/measures', exist_ok=True)
@@ -187,7 +175,9 @@ for e in measure_entries:
     h, w = img.shape[:2]
     x0 = max(0, e['x0'] - PAD_X)
     x1 = min(w, e['x1'] + PAD_X)
-    crop = img[e['y0']:e['y1'], x0:x1]
+    y0 = e['y0']
+    y1 = min(h, e['first_staff_bot'])
+    crop = img[y0:y1, x0:x1]
     out = f"_scratch/measures/p{e['page']}_s{e['system_idx']}_g{e['gap_idx']}_M{e['measure']}.png"
     cv2.imwrite(out, crop)
     e['crop_path'] = out
@@ -197,12 +187,40 @@ for e in measure_entries:
 
 **Decision flow:**
 
-1. Generate **full-height per-measure crops** (section 3C)
-2. Run **PaddleOCR** on each crop. Parse `ocr.ocr(path, cls=False)`, collect text with conf ≥ 0.5.
+1. Generate **first-staff per-measure crops** (section 3C)
+2. Run **PaddleOCR** on each crop. Parse `ocr.ocr(path, cls=False)`.
 3. **Normalize** via `normalize_chord_text(cn)` — handles spaces (`D M7`→`DM7`), `E7sus4`→`Esus4addb7`, etc.
-4. **Filter non-chords**: keep only lines matching `^[A-G][#b]?` or `^/[A-G][#b]?$` (chord roots + standalone slashes)
-5. For any measure with **confidence < 0.5** or **unparseable output**, fall back to vision_analyze on the same full-height crop (see prompt below).
-6. Assign beat positions: if PaddleOCR gives chord texts but no beats, space chords evenly across the measure. Vision fallback gives explicit beats.
+4. **Filter non-chords**: normalize first, then keep only lines matching chord/root/slash patterns (regex must accept `[A-Ga-g]`, because PaddleOCR can output lowercase roots on small crops).
+5. For any measure with **confidence < 0.5** or **unparseable output**, fall back to vision_analyze on the same crop (see prompt below). For borderline accepted candidates (`0.5 <= conf < 0.8`), keep the chord but log/flag it for review instead of silently treating it as fully verified.
+6. **Beat assignment from PaddleOCR bbox x-coordinates** (not hardcoded spacing). Each OCR result includes a bounding box — normalize its center-x within the measure width, then map to the nearest valid beat grid for the time signature:
+
+   ```python
+   measure_px = e['x1'] - e['x0']
+   beats_map = {
+       '4/4': [1.0, 2.0, 3.0, 4.0],
+       '3/4': [1.0, 2.0, 3.0],
+       '6/8': [1.0, 4.0],
+   }
+   valid_beats = beats_map.get(TIME_SIG, [1.0])
+   crop_x0 = max(0, e['x0'] - PAD_X)
+   chords = []
+   ocr_debug = []
+
+   for line in result[0] or []:
+       bbox = line[0]  # [[x1,y1],[x2,y2],[x3,y3],[x4,y4]] in crop coordinates
+       txt, conf = line[1][0], line[1][1]
+       if conf < 0.5 or not is_chord(txt):
+           continue
+       chord_x_page = (bbox[0][0] + bbox[2][0]) / 2 + crop_x0
+       rel_x = max(0.0, min(1.0, (chord_x_page - e['x0']) / measure_px))
+       target = valid_beats[0] + rel_x * (valid_beats[-1] - valid_beats[0])
+       beat = min(valid_beats, key=lambda b: abs(b - target))
+       chord = normalize_chord_text(txt)
+       chords.append((chord, beat))          # chord_map stores 2-tuples only
+       ocr_debug.append((chord, beat, conf)) # keep confidence only for logging/debugging
+   ```
+
+   Fallback (no valid bbox): space chords evenly by count. Vision fallback always returns explicit beats.
 
 **Vision fallback prompt:**
 
@@ -226,38 +244,20 @@ chord_map = {
 }
 ```
 
-**PaddleOCR** (v2.10.0 with paddlepaddle 2.6.2) reads chord symbols with high accuracy including sharp (#) and slash (/) glyphs. Speed: ~0.25-0.6s per image.
-
-**Requirements:** Python 3.11 (paddlepaddle does not support 3.14+). Use a separate venv.
+**PaddleOCR setup:** use Python 3.11 in a separate venv; paddlepaddle does not support 3.14+.
 
 ```bash
 python3.11 -m venv /path/to/paddle_venv
 /path/to/paddle_venv/bin/pip install "paddlepaddle<3.0" "paddleocr<3.0"
 ```
 
-**Usage:**
-
 ```python
 from paddleocr import PaddleOCR
 ocr = PaddleOCR(use_angle_cls=False, lang='en', show_log=False)
 result = ocr.ocr(e['crop_path'], cls=False)
-if result and result[0]:
-    for line in result[0]:
-        txt = line[1][0]
-        conf = line[1][1]
-        # txt = 'F#m', conf = 0.99
 ```
 
-**Post-processing for PaddleOCR output:**
-
-PaddleOCR sometimes introduces spaces in chord text. Normalize before music21 parsing:
-- `D M7` → `DM7`, `D m` → `Dm` (spaces inside chord glyphs)
-- `E 7sus4` → `E7sus4` (space before number)
-The standard `normalize_chord_text()` function already handles space removal via `re.sub(r'\s+', '', cn)`, so these are automatically fixed for chord parsing.
-
-**Fallback:** If a per-measure crop's PaddleOCR output is low confidence (<0.5) or returns nonsense, fall back to vision_analyze on the same crop. PaddleOCR processes the entire image in one pass and returns all detected text lines — filter to chord-pattern matching (`^[A-G][#b]?`) to isolate chord symbols from lyrics.
-
-OCR engine comparison is in `references/paddleocr-setup.md`. In practice: always use PaddleOCR first via full-height per-measure crops. Fall back to vision_analyze only if PaddleOCR returns low confidence (<0.5) or unparseable text.
+Normalize before filtering/parsing; `normalize_chord_text()` removes OCR spaces such as `D M7`, `D m`, `E 7sus4`. OCR engine comparison is in `references/paddleocr-setup.md`.
 
 ---
 
@@ -327,23 +327,15 @@ score2 = converter.parse(score.write('musicxml', '_base.mxl'))
 
 ### 4D. Chord injection: normalize → music21 parser → fail fast
 
-Use music21's built-in `harmony.ChordSymbol(cn)` first after light OCR/PDF normalization. `changeAbbreviationFor()` changes generated/default `figure` abbreviations, but it does **not** add MusicXML `<kind text="...">` by itself:
+Normalize OCR/PDF artifacts, then use music21's built-in `harmony.ChordSymbol(cn)`. Fail fast on parser errors. Apply display policy only after semantic parsing succeeds; do not use `chordKindStr` or abbreviation changes as parser substitutes.
 
-```python
-from music21 import harmony
-harmony.changeAbbreviationFor('major-seventh', 'M7')                 # optional: generated figure DM7
-harmony.changeAbbreviationFor('suspended-fourth-seventh', '7sus4')  # optional: generated figure E7sus4
-```
-
-For the normal one-shot `python gen_mxl.py` workflow, one call per script run is safe: each fresh Python process starts from music21's original abbreviation list, so duplicates do **not** accumulate across runs. Only use an idempotent helper in long-lived Python processes such as notebooks, servers, REPL sessions, or repeated setup calls inside one process.
-
-The parser already decomposes chord figures into:
+The parser decomposes chord figures into:
 
 ```text
 root + one chordKind + zero/more ChordStepModification + optional bass
 ```
 
-Confirmed covered examples include `C7b9`, `C7 add b9`, `G7subtract5addb9add#9add#11addb13`, `F7 add 4 subtract 3`, `Aadd9`, `Dadd9`, `DM7`, `F#m/E`, and slash chords. Important exception: music21 parses `E7sus4` as `chordKind='suspended-fourth-seventh'`, but that value is **not** in the MusicXML `kind-value` enum and can render literally in MuseScore. Normalize `E7sus4`/`E7sus` to `Esus4addb7` for music21 pitch correctness, then export as `<kind text="7sus4">suspended-fourth</kind>` plus hidden added seventh degree (`degree-alter=0` per MusicXML's add-degree rule) in MusicXML post-process.
+Known covered examples include `C7b9`, `Aadd9`, `DM7`, `F#m/E`, and slash chords. Important exception: music21 parses `E7sus4` as `chordKind='suspended-fourth-seventh'`, which is not a MusicXML `kind-value`. Normalize `E7sus4`/`E7sus` to `Esus4addb7`, then export as `<kind text="7sus4">suspended-fourth</kind>` plus hidden added seventh degree in MusicXML post-process.
 
 Normalize common source-score/OCR artifacts before parsing:
 
@@ -421,7 +413,7 @@ def apply_kind_display_from_chord_types(cs: harmony.ChordSymbol) -> None:
         cs.chordKindStr = abbr
 ```
 
-This keeps `C7b9` split correctly as `kindStr='7'` plus MusicXML `<degree>` for `b9`, instead of stuffing the whole chord suffix into `<kind text>`. For `7sus4`, do **not** export music21's `suspended-fourth-seventh` kind: MusicXML does not define it. Encode it as valid `suspended-fourth` + hidden added minor-7 degree, with `kindStr='7sus4'`. **Do not set `chordKindStr` as a semantic fix.** It is a display-text override and can mask incorrect kind/pitches if used before/without correct parsing. If a display override is needed after correct semantic parsing, derive it from `CHORD_TYPES` and keep it separate from semantic validation.
+This keeps semantic parsing separate from display text: e.g. `C7b9` remains `kindStr='7'` plus a MusicXML `<degree>` for `b9`. For `7sus4`, export valid `suspended-fourth` + hidden added minor-7 degree with `kindStr='7sus4'`; never export music21's non-MusicXML `suspended-fourth-seventh` kind.
 
 ### 4E. Barlines and repeats
 
@@ -460,4 +452,4 @@ print(f'{actual} chords in final.mxl')
 
 - **300dpi required** unless detector parameters are recalibrated.
 - **music21 offset behavior:** Negative `<offset sound="yes">` values in MusicXML (e.g., -20160 at beat 3) are correct — they are relative to the rest's END, not the measure start. Do not treat as a bug.
-- **References:** `references/paddleocr-setup.md` (OCR setup & comparison), `references/music21-harmony-display.md` (display internals), `references/musicxml-7sus4.md` (7sus4 XML basis), `references/detection-params-300dpi.md` (detector params), `references/repeat-sign-notation.md` (repeat XML).
+- **References:** `references/paddleocr-setup.md` (OCR setup & comparison), `references/beat-assignment-from-bbox.md` (x-position beat logic), `references/music21-harmony-display.md` (display internals), `references/musicxml-7sus4.md` (7sus4 XML basis), `references/detection-params-300dpi.md` (detector params), `references/repeat-sign-notation.md` (repeat XML).
