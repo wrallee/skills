@@ -69,3 +69,17 @@ def normalize_paddleocr(cn):
 | vision LLM | ✅ | ✅ (full crop) | ✅ | ~8-12s | ✅ context 이해 |
 
 Tested on: Sing Street "To Find You", G-Dragon "Untitled 2014", 청하 "Roller Coaster". All tests used the same full-height measure crops, not chord-only crops (which would favor OCR engines further).
+
+## Deployment / Integration Options (beyond Python pip)
+
+PaddleOCR is a **Python package**, but Paddle Inference models (det+rec) can be deployed outside Python:
+
+| Approach | Language | Effort | Notes |
+|----------|----------|--------|-------|
+| **Paddle Inference Java API** (JNI) | Java | 중간 | `com.baidu.paddle.inference` — Config, Predictor, Tensor classes. GitHub: `PaddlePaddle/Paddle` → `paddle/fluid/inference/experimental/javaapi/`. **실험적(experimental)**. Low-level — OCR pipeline logic (detection post-processing → recognition decoding → result assembly) must be reimplemented in Java. |
+| **Paddle Inference C API** | C (→ any JNI) | 중간 | 기반 C API로 다른 언어 바인딩 가능. JavaCPP로 wrapping도 가능 (bytedeco 스타일). |
+| **Paddle Lite / Paddle2ONNX** | Android Java / any | 중간 | Mobile deployment via Android Java SDK. ONNX export → ONNX Runtime from any language. |
+| **Python subprocess** | Java → Python | 낮음 | `Runtime.exec("python3 -c '...'")` — simplest, but Python dependency + IPC overhead. |
+| **HTTP server** | Java → Python REST | 낮음 | FastAPI/Flask wrapper, Java calls HTTP. Clean separation, no JNI complexity. |
+
+**Key takeaway:** Paddle Inference does have an official Java JNI API (experimental), so writing JavaCPP bindings from scratch is NOT required. However, PaddleOCR's high-level pipeline (detection → recognition → result assembly) is Python-only — porting that pipeline logic to Java is the real work, not the JNI layer itself.
