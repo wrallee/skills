@@ -13,11 +13,18 @@ description: >-
 
 ## Pitfalls
 
-- **Don't over-verify with vision.** Use vision only for OCR failure, low-confidence output, or targeted sharp-key checks. Otherwise generate the `.mxl` and let the user review.
+- **Don't over-verify with full vision.** Use vision only for conf < 0.8 (low/borderline OCR) and targeted sharp-key checks. For conf >= 0.8, keep the OCR text and let the custom MusicXML parser validate — do not vision-check every measure.
+- **Borderline must use vision.** Do NOT auto-accept 0.5-0.8 conf chords even if they pass the whitelist and custom parser — the OCR text may be plausible-looking but wrong. Send to vision_analyze for confirmation.
+- **No answer key.** Never use prior session data, reference files, or memory of "what should be there" to correct OCR output before presenting it to the user. The user explicitly considers this cheating and will reset the pipeline. Corrections come from vision_analyze or user input, not from prior knowledge.
+- **When stuck, show the crop.** If a chord fails all automation (parse failure, slash-bass without context, ambiguous OCR), present the actual crop image to the user with MEDIA: — one item per message. Do not batch them or guess the intended chord.
 - **OCR misses # on sharp keys.** PaddleOCR can miss the `#` glyph in 4+ sharp keys (E major, B major, etc.), reading `F` instead of `F#`, `C` instead of `C#`. After OCR, flag single-letter chords that are diatonic sharps in the key signature — verify with vision only for those, or note them for user review.
-- **`(add9)` parentheses.** music21 rejects `A(add9)` — strip parens to `Aadd9` before `ChordSymbol()`.
+- **`(add9)` parentheses.** Normalize `A(add9)` → `Aadd9` before the custom MusicXML parser; do not leave this to music21's string parser.
 - **Crop = first staff area only.** Crops run from system start (`y0`) to first staff bottom (`staves[0].bot`). This captures chord symbols above the staff while excluding lower staffs that add OCR noise. Use PAD_X=16 and do not add top/bottom margins by default. If you modify crop parameters, re-verify OCR output on a representative sample.
 - **PaddleOCR scope = chord symbols only.** PaddleOCR reads printed chord text (`DM7`, `G/B`, `F#m`), not notation symbols. Full notation needs OMR; do not expand this pipeline beyond chords.
+- **`key` name shadowing (4A/4C).** The break-map loop in section 4A uses a loop variable named `key`. When `from music21 import key` is used in section 4C, the loop variable shadows the import — later calls to `key.KeySignature()` fail with `AttributeError: 'tuple' object has no attribute 'KeySignature'`. Always name the loop variable `sys_key` or `k` to avoid the collision.
+- **OCR digit confusion 7↔9.** PaddleOCR can misread `7` as `9`, but `9sus4` is also a legitimate printed chord. Do **not** auto-correct `9sus4` → `7sus4`. If confidence is <0.8 or the crop is visually ambiguous, verify via vision/user; otherwise parse `9sus4` as MusicXML `suspended-fourth` + added b7 + added 9.
+- **OCR trailing characters on chord roots.** PaddleOCR occasionally appends stray characters to chord text (`F#m7I`, `C#m7/`). The chord-candidate whitelist/regex may accept these (they start with a valid root), but the custom parser must reject them. Log and flag such failures for review rather than silently trimming.
+- **Standalone slash-bass at sequence start.** When the first chord(s) in a piece are standalone slash symbols (`/G#`, `/B`) without a preceding full chord, `prev_full = ''` and the `/`→ full-chord resolution cannot construct a complete chord. This usually means OCR missed the preceding full chord. Flag it for user review rather than guessing the root.
 
 ---
 
@@ -189,10 +196,14 @@ for e in measure_entries:
 
 1. Generate **first-staff per-measure crops** (section 3C)
 2. Run **PaddleOCR** on each crop. Parse `ocr.ocr(path, cls=False)`.
-3. **Normalize** via `normalize_chord_text(cn)` — handles spaces (`D M7`→`DM7`), `E7sus4`→`Esus4addb7`, etc.
-4. **Filter non-chords**: normalize first, then keep only lines matching chord/root/slash patterns (regex must accept `[A-Ga-g]`, because PaddleOCR can output lowercase roots on small crops).
-5. For any measure with **confidence < 0.5** or **unparseable output**, fall back to vision_analyze on the same crop (see prompt below). For borderline accepted candidates (`0.5 <= conf < 0.8`), keep the chord but log/flag it for review instead of silently treating it as fully verified.
-6. **Beat assignment from PaddleOCR bbox x-coordinates** (not hardcoded spacing). Each OCR result includes a bounding box — normalize its center-x within the measure width, then map to the nearest valid beat grid for the time signature:
+3. **Normalize** via `normalize_chord_text(cn)` — handles spaces (`D M7`→`DM7`), Unicode accidentals, and parenthesized adds (`A(add9)`→`Aadd9`). Do not do semantic rewrites like `7sus4`→`sus4addb7` in the OCR phase; semantic decomposition belongs in the custom MusicXML parser.
+4. **Filter non-chords**: normalize first, then apply a case-insensitive chord-candidate whitelist/regex. Use it only to reject non-chords, not to auto-correct to the nearest chord.
+5. **Confidence triage**:
+   - `conf < 0.5` → **vision_analyze fallback** immediately (see prompt below). Do not keep the OCR text.
+   - `0.5 <= conf < 0.8` → **borderline** → flag for vision_analyze verification. Do NOT auto-accept even if whitelist+custom parser pass — the OCR text may be wrong even when it looks parseable.
+   - `conf >= 0.8` → **accepted** → keep as candidate. Still subject to custom MusicXML parser validation in Phase 3E.
+6. After PaddleOCR + vision fallback for low/borderline conf, run **custom MusicXML parser validation** on all accepted candidates (section 3E). Chords that pass confidence but fail our parser are NOT automatically correct — they may be OCR artifacts or unsupported spellings that need user review.
+7. **Beat assignment from PaddleOCR bbox x-coordinates** (not hardcoded spacing). Each OCR result includes a bounding box — normalize its center-x within the measure width, then map to the nearest valid beat grid for the time signature:
 
    ```python
    measure_px = e['x1'] - e['x0']
@@ -206,16 +217,24 @@ for e in measure_entries:
    chords = []
    ocr_debug = []
 
+   CHORD_CANDIDATE_RE = re.compile(
+       r'^(?:[A-G][#b]?(?:[A-Za-z0-9+#b()/-]*)|/[A-G][#b]?)$',
+       re.IGNORECASE,
+   )
+
+   def is_chord_candidate(cn: str) -> bool:
+       return bool(CHORD_CANDIDATE_RE.match(cn))
+
    for line in result[0] or []:
        bbox = line[0]  # [[x1,y1],[x2,y2],[x3,y3],[x4,y4]] in crop coordinates
-       txt, conf = line[1][0], line[1][1]
-       if conf < 0.5 or not is_chord(txt):
+       raw, conf = line[1][0], line[1][1]
+       chord = normalize_chord_text(raw)
+       if conf < 0.5 or not is_chord_candidate(chord):
            continue
        chord_x_page = (bbox[0][0] + bbox[2][0]) / 2 + crop_x0
        rel_x = max(0.0, min(1.0, (chord_x_page - e['x0']) / measure_px))
        target = valid_beats[0] + rel_x * (valid_beats[-1] - valid_beats[0])
        beat = min(valid_beats, key=lambda b: abs(b - target))
-       chord = normalize_chord_text(txt)
        chords.append((chord, beat))          # chord_map stores 2-tuples only
        ocr_debug.append((chord, beat, conf)) # keep confidence only for logging/debugging
    ```
@@ -259,6 +278,20 @@ result = ocr.ocr(e['crop_path'], cls=False)
 
 Normalize before filtering/parsing; `normalize_chord_text()` removes OCR spaces such as `D M7`, `D m`, `E 7sus4`. OCR engine comparison is in `references/paddleocr-setup.md`.
 
+### 3E. Compile unresolved items → user cross-check
+
+**Before generating .mxl**, run custom MusicXML parser validation on all accepted+vision-confirmed candidates and collect every chord that cannot be automatically resolved:
+
+1. **Custom parser failures** — chords that pass the whitelist/regex but fail `parse_chord()` or `make_music21_chord()`. These may be OCR artifacts (`F#m7I`, `C#m7/`) or unsupported legitimate spellings. Do NOT silently correct them based on prior knowledge or answer keys — the user must see them.
+
+2. **Standalone slash-bass resolution failures** — `/F`, `/E`, `/G#`, etc. that cannot attach to a previous full chord because `prev_full` is empty (first chord(s) of the piece, or OCR missed the full chord in a prior measure). These need user input.
+
+3. **vision_analyze borderline corrections** — when borderlines were verified with vision and the vision result differs from or adds to the OCR output, note the correction for user awareness.
+
+Present each unresolved item to the user with the actual crop image (MEDIA: path). Wait for user input on each before proceeding. Only after all items are resolved should you proceed to Phase 4 (.mxl generation).
+
+**Never consult answer keys, prior session data, or reference files to correct unresolved chords before showing the user what the raw pipeline produced.** The user explicitly flags this as cheating. The pipeline output (including all errors) must be presented faithfully; corrections come from the user or from vision, not from memory of what "should" be there.
+
 ---
 
 ## 4. .mxl generation
@@ -276,11 +309,11 @@ seen_pages = set()
 for e in measure_entries:
     if e.get('skip'):
         continue
-    key = (e['page'], e['system_idx'])
-    if key not in seen_systems:
+    sys_key = (e['page'], e['system_idx'])
+    if sys_key not in seen_systems:
         if e['measure'] > 1:
             sys_breaks.add(e['measure'])
-        seen_systems.add(key)
+        seen_systems.add(sys_key)
     if e['page'] not in seen_pages:
         if e['measure'] > 1:
             pg_breaks.add(e['measure'])
@@ -325,95 +358,192 @@ score.insert(0, part)
 score2 = converter.parse(score.write('musicxml', '_base.mxl'))
 ```
 
-### 4D. Chord injection: normalize → music21 parser → fail fast
+### 4D. Chord injection: MusicXML-spec custom parser → music21 compatible form
 
-Normalize OCR/PDF artifacts, then use music21's built-in `harmony.ChordSymbol(cn)`. Fail fast on parser errors. Apply display policy only after semantic parsing succeeds; do not use `chordKindStr` or abbreviation changes as parser substitutes.
+**Don't rely on music21's `ChordSymbol(cn)` string parser alone** — music21 has internal `chordKind` values (e.g. `suspended-fourth-seventh`) that don't exist in the MusicXML `kind-value` enum, causing broken `.mxl` output. Instead, define our own parser based on the MusicXML spec, then feed music21 a form it can render correctly.
 
-The parser decomposes chord figures into:
-
-```text
-root + one chordKind + zero/more ChordStepModification + optional bass
-```
-
-Known covered examples include `C7b9`, `Aadd9`, `DM7`, `F#m/E`, and slash chords. Important exception: music21 parses `E7sus4` as `chordKind='suspended-fourth-seventh'`, which is not a MusicXML `kind-value`. Normalize `E7sus4`/`E7sus` to `Esus4addb7`, then export as `<kind text="7sus4">suspended-fourth</kind>` plus hidden added seventh degree in MusicXML post-process.
+**Architecture:** chord text → normalize → `parse_chord()` → `make_music21_chord()` → insert into measure.
 
 Normalize common source-score/OCR artifacts before parsing:
 
-- remove spacing inside chord glyphs: `F #m` → `F#m`, `D M7` → `DM7`, `B m7` → `Bm7`
-- unicode accidentals: `♭` → `b`, `♯` → `#`
-- Finale/PDF spaced suffixes: `C #7` → `C#7`
-- parenthesized add chords when semantically identical: `A(add9)` → `Aadd9`, `D(add9)` → `Dadd9`
-- spaced suffixes from vision/PDF text: `E sus4` → `Esus4`, `E 7` → `E7`
-- **7sus4 normalization:** `E7sus4`/`E7sus` → `Esus4addb7` before feeding to `ChordSymbol`. This produces valid MusicXML (`suspended-fourth` kind + hidden minor-7 degree) instead of the invalid `suspended-fourth-seventh` kind. Implementation:
-  ```python
-  m_sus = re.match(r'^([A-G][#b]?)(.*)7sus4?$', cn)
-  if m_sus:
-      cn = f'{m_sus.group(1)}sus4addb7'
-  ```
-- standalone slash-bass symbols printed in the chart: `/F`, `/E`, `/G#`, `/A`, `/B` → attach to the most recent full chord root/kind before parsing, e.g. previous `C#7` + `/F` → `C#7/F`; previous `F#m7` + `/G#` → `F#m7/G#`
+```python
+def norm(cn):
+    cn = re.sub(r'\s+', '', str(cn)).replace('♭','b').replace('♯','#')
+    cn = re.sub(r'\(add(\d+)\)', r'add\1', cn)
+    cn = cn.replace('(','').replace(')','')
+    if cn and cn[0].isalpha(): cn = cn[0].upper() + cn[1:]
+    return cn
+```
 
-Do not treat standalone slash-bass symbols as independent chord roots; they are contextual shorthand and must resolve against the last full printed chord before passing to `harmony.ChordSymbol`.
+**Custom chord parser** — decomposes chord text into MusicXML-compatible components:
+
+```python
+def parse_chord(cn):
+    """
+    Returns dict {root, kind (MusicXML kind-value), alterations, bass, display}
+    or None if unparsable. Slash-bass returns {bass, needs_prev: True}.
+    """
+    cn = norm(cn)
+    
+    # Standalone slash-bass
+    m = re.match(r'^/([A-G][#b]?)$', cn)
+    if m:
+        return {'bass': m.group(1), 'needs_prev': True}
+    
+    # Split off slash bass
+    bass = None
+    if '/' in cn:
+        parts = cn.split('/')
+        if len(parts) == 2 and re.match(r'^[A-G][#b]?$', parts[1]):
+            bass = parts[1]; cn = parts[0]
+        else:
+            return None
+    
+    # Extract root
+    m = re.match(r'^([A-G][#b]?)', cn)
+    if not m: return None
+    root = m.group(1); rest = cn[len(root):]
+    
+    # Quality patterns (MusicXML kind-value, longest match first)
+    # Format: (regex, music21_kind, display_text)
+    Q = [
+        (r'^mMaj7','minor-major-seventh','mMaj7'), (r'^mM7','minor-major-seventh','mM7'),
+        (r'^maj7','major-seventh','maj7'), (r'^M13','major-13th','M13'),
+        (r'^M11','major-11th','M11'), (r'^M9','major-ninth','M9'),
+        (r'^M7','major-seventh','M7'), (r'^m13','minor-13th','m13'),
+        (r'^m11','minor-11th','m11'), (r'^m9','minor-ninth','m9'),
+        (r'^m7','minor-seventh','m7'), (r'^m6','minor-sixth','m6'),
+        (r'^m','minor','m'), (r'^dim7','diminished-seventh','dim7'),
+        (r'^dim','diminished','dim'), (r'^aug7','augmented-seventh','aug7'),
+        (r'^aug','augmented','aug'),
+        (r'^sus4','suspended-fourth','sus4'), (r'^sus2','suspended-second','sus2'),
+        (r'^7sus4','suspended-fourth','7sus4'),
+        (r'^9sus4','suspended-fourth','9sus4'),
+        (r'^13','dominant-13th','13'), (r'^11','dominant-11th','11'),
+        (r'^9','dominant-ninth','9'), (r'^7','dominant-seventh','7'),
+        (r'^6','major-sixth','6'), (r'^$','major',''),  # plain triad
+    ]
+    
+    def degree_mod_type(kind, degree):
+        # MusicXML degree-type is "alter" only when changing a degree that
+        # already belongs to the chosen kind; otherwise it is an added tone.
+        core = {
+            'major': {1,3,5}, 'minor': {1,3,5},
+            'augmented': {1,3,5}, 'diminished': {1,3,5},
+            'suspended-fourth': {1,4,5}, 'suspended-second': {1,2,5},
+            'major-sixth': {1,3,5,6}, 'minor-sixth': {1,3,5,6},
+            'dominant-seventh': {1,3,5,7}, 'major-seventh': {1,3,5,7},
+            'minor-seventh': {1,3,5,7}, 'diminished-seventh': {1,3,5,7},
+            'augmented-seventh': {1,3,5,7}, 'minor-major-seventh': {1,3,5,7},
+            'dominant-ninth': {1,3,5,7,9}, 'major-ninth': {1,3,5,7,9},
+            'minor-ninth': {1,3,5,7,9},
+            'dominant-11th': {1,3,5,7,9,11}, 'major-11th': {1,3,5,7,9,11},
+            'minor-11th': {1,3,5,7,9,11},
+            'dominant-13th': {1,3,5,7,9,11,13}, 'major-13th': {1,3,5,7,9,11,13},
+            'minor-13th': {1,3,5,7,9,11,13},
+        }
+        return 'alter' if degree in core.get(kind, set()) else 'add'
+    
+    for pat, kind, display in Q:
+        m = re.match(pat, rest)
+        if not m: continue
+        tail = rest[len(m.group(0)):]
+        alts = []
+        while tail:
+            am = re.match(r'([b#])(\d+)', tail)  # b9, #11
+            if am:
+                degree = int(am.group(2))
+                alts.append((degree_mod_type(kind, degree), degree, -1 if am.group(1)=='b' else 1))
+                tail = tail[am.end():]
+                continue
+            am = re.match(r'add(\d+)', tail)       # add9
+            if am: alts.append(('add', int(am.group(1)), 0)); tail = tail[am.end():]; continue
+            am = re.match(r'omit(\d+)', tail)      # omit5
+            if am: alts.append(('subtract', int(am.group(1)), 0)); tail = tail[am.end():]; continue
+            break
+        if tail:
+            continue
+        return {'root': root, 'kind': kind, 'display': display, 'alterations': alts, 'bass': bass}
+    
+    return None
+```
+
+**Construct music21 ChordSymbol from parsed dict:**
+
+Use `ChordSymbol(root=root, kind=...)` + `addChordStepModification()` for degree alterations. Set `chordKindStr` for the display suffix. **Never use music21's string-based `ChordSymbol(cn)` constructor as the parser/validator** — it may produce non-MusicXML kinds.
 
 ```python
 from music21 import harmony
+from music21.harmony import ChordStepModification
 
+def make_chord(parsed, prev_full=''):
+    """parsed dict → music21 ChordSymbol. Returns None on failure."""
+    
+    # Standalone slash-bass: attach to prev_full
+    if parsed.get('needs_prev'):
+        if not prev_full: return None
+        return make_chord(parse_chord(f'{prev_full}/{parsed["bass"]}'), prev_full)
+    
+    root, kind, display = parsed['root'], parsed['kind'], parsed['display']
+    alts = parsed.get('alterations', [])
+    bass = parsed.get('bass')
+    
+    # --- Known edge cases that need custom construction ---
+    
+    # 9sus4: music21 has no built-in. suspended-fourth + add b7 + add 9
+    if display == '9sus4':
+        cs = harmony.ChordSymbol(root=root, kind='suspended-fourth')
+        cs.addChordStepModification(ChordStepModification('add', 7, -1))
+        cs.addChordStepModification(ChordStepModification('add', 9, 0))
+        cs.chordKindStr = '9sus4'
+        if bass: cs.bass(bass)
+        return cs
+    
+    # 7sus4: suspended-fourth + add b7
+    if display == '7sus4':
+        cs = harmony.ChordSymbol(root=root, kind='suspended-fourth')
+        cs.addChordStepModification(ChordStepModification('add', 7, -1))
+        cs.chordKindStr = '7sus4'
+        if bass: cs.bass(bass)
+        return cs
+    
+    # --- Standard chords: construct from our parsed MusicXML kind ---
+    # This avoids music21's string parser entirely for validation.
+    try:
+        cs = harmony.ChordSymbol(root=root, kind=kind)
+        for atype, degree, alter in alts:
+            cs.addChordStepModification(ChordStepModification(atype, degree, alter))
+        if display is not None:
+            cs.chordKindStr = display
+        if bass:
+            cs.bass(bass)
+        return cs
+    except Exception:
+        return None
+```
+
+**Injection loop with prev_full tracking:**
+
+```python
 prev_full = ''
 for mn, chords in sorted(chord_map.items()):
     m = score2.parts[0].measure(mn)
     for cn, beat in chords:
-        cn = normalize_chord_text(cn)
-        if cn.startswith('/') and len(cn) > 1 and prev_full:
-            cn = f'{prev_full}{cn}'
-        offset = (float(beat) - 1.0) * 1.0  # beat 1 -> offset 0.0 in 4/4
-        cs = harmony.ChordSymbol(cn)
+        parsed = parse_chord(norm(cn))
+        if parsed is None:
+            print(f'WARNING M{mn}: unparseable "{cn}"')
+            continue
+        cs = make_chord(parsed, prev_full)
+        if cs is None:
+            print(f'WARNING M{mn}: cannot construct chord from parsed "{cn}" (parsed={parsed})')
+            continue
+        offset = (float(beat) - 1.0) * 1.0
         m.insert(offset, cs)
-        # Track FULL chord text (before any /), not just root note
         if not cn.startswith('/'):
             prev_full = cn.split('/')[0] if '/' in cn else cn
-
-score2.write('musicxml', '_raw.musicxml')
 ```
 
-Do **not** silently fallback or guess on parser failure. If music21 rejects a chord spelling, log the exact measure/chord/error and let the exception fail the generation so the user can see and correct the source spelling or decide on an explicit normalization rule.
-
-Known examples that need semantic normalization before `ChordSymbol`: flat roots with `b` spelling (`BbM7`, `Bbm7` → music21 `B-` root), suffix case/alias variants (`Cmaj9` → `CM9`/`CMaj9`), and compound-quality variants (`C+maj7` → `C+M7`/`Caugmaj7`, `CmMaj7` → `CmM7`/`Cminmaj7`). Treat these as root/quality/degree parsing issues, not display fixes.
-
-After semantic parsing succeeds, set renderer-facing suffix text from music21's own `CHORD_TYPES` abbreviation data. This is safe only **after** `ChordSymbol(cn)` produced the correct pitches/kind; do not use it as a parser substitute:
-
-```python
-from music21 import harmony
-
-def prefer_abbreviation(chord_type: str, abbr: str) -> None:
-    abbrs = harmony.CHORD_TYPES[chord_type][1]
-    if abbr in abbrs:
-        abbrs.remove(abbr)
-    abbrs.insert(0, abbr)
-
-def configure_chord_display_policy() -> None:
-    # Keep plain major triads bare (C, D, ...), but prefer M spellings
-    # for major seventh/extended qualities instead of maj/Maj spellings.
-    prefer_abbreviation('major-seventh', 'M7')
-    prefer_abbreviation('major-ninth', 'M9')
-    prefer_abbreviation('major-11th', 'M11')
-    prefer_abbreviation('major-13th', 'M13')
-    prefer_abbreviation('suspended-fourth', 'sus4')
-    prefer_abbreviation('suspended-fourth-seventh', '7sus4')
-
-def apply_kind_display_from_chord_types(cs: harmony.ChordSymbol) -> None:
-    mods = {(m.modType, m.degree, m.interval.semitones) for m in cs.chordStepModifications}
-    if cs.chordKind == 'suspended-fourth' and ('add', 7, -1) in mods:
-        cs.chordKindStr = harmony.getCurrentAbbreviationFor('suspended-fourth-seventh')
-        return
-
-    kind = harmony.CHORD_ALIASES.get(cs.chordKind, cs.chordKind)
-    if kind not in harmony.CHORD_TYPES:
-        return
-    abbr = harmony.getCurrentAbbreviationFor(kind)
-    if abbr:
-        cs.chordKindStr = abbr
-```
-
-This keeps semantic parsing separate from display text: e.g. `C7b9` remains `kindStr='7'` plus a MusicXML `<degree>` for `b9`. For `7sus4`, export valid `suspended-fourth` + hidden added minor-7 degree with `kindStr='7sus4'`; never export music21's non-MusicXML `suspended-fourth-seventh` kind.
+**Fail strategy:** Do not silently guess on parser failure. Log the exact measure/chord/error. For the final `.mxl` generation, collect all failures into a review list and present to the user. Only fail the run entirely if the user explicitly requested fail-fast. The chord-level output is partial — chords that parsed correctly are included, failures are skipped. The verification assertion only checks measure count, not chord count, when failures exist.
 
 ### 4E. Barlines and repeats
 
@@ -452,4 +582,4 @@ print(f'{actual} chords in final.mxl')
 
 - **300dpi required** unless detector parameters are recalibrated.
 - **music21 offset behavior:** Negative `<offset sound="yes">` values in MusicXML (e.g., -20160 at beat 3) are correct — they are relative to the rest's END, not the measure start. Do not treat as a bug.
-- **References:** `references/paddleocr-setup.md` (OCR setup & comparison), `references/beat-assignment-from-bbox.md` (x-position beat logic), `references/music21-harmony-display.md` (display internals), `references/musicxml-7sus4.md` (7sus4 XML basis), `references/detection-params-300dpi.md` (detector params), `references/repeat-sign-notation.md` (repeat XML).
+- **References:** `references/paddleocr-setup.md` (OCR setup & comparison), `references/ocr-confidence-and-chord-filtering.md` (confidence thresholds + case-insensitive reject-only chord filtering), `references/beat-assignment-from-bbox.md` (x-position beat logic), `references/music21-harmony-display.md` (display internals), `references/musicxml-7sus4.md` (7sus4 XML basis), `references/musicxml-custom-chord-parser.md` (MusicXML-spec parser architecture and verification), `references/detection-params-300dpi.md` (detector params), `references/repeat-sign-notation.md` (repeat XML).
