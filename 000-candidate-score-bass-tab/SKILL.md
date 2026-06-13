@@ -1,5 +1,5 @@
 ---
-name: score-bass-tab-transcriber
+name: 000-candidate-score-bass-tab
 description: >-
   Use this skill after an approved LilyPond score skeleton exists to create or
   correct bass tab arrangements from that skeleton, source score, reference
